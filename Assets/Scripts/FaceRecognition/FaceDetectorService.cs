@@ -27,6 +27,10 @@ namespace HoloFaceRecognition
 
     public sealed class FaceDetectorService : IFaceDetectorService
     {
+        public string LastStatus { get; private set; } = "Detector not initialized";
+        public string LastError { get; private set; } = string.Empty;
+        public int LastDetectedFaceCount { get; private set; }
+
 #if WINDOWS_UWP && !UNITY_EDITOR
         FaceDetector _detector;
 #endif
@@ -34,8 +38,22 @@ namespace HoloFaceRecognition
         public async Task InitializeAsync()
         {
 #if WINDOWS_UWP && !UNITY_EDITOR
-            _detector = await FaceDetector.CreateAsync();
+            try
+            {
+                _detector = await FaceDetector.CreateAsync();
+                LastStatus = "UWP FaceDetector initialized";
+                LastError = string.Empty;
+            }
+            catch (Exception ex)
+            {
+                LastStatus = "UWP FaceDetector init failed";
+                LastError = ex.GetType().Name + ": " + ex.Message;
+                UnityEngine.Debug.LogException(ex);
+                throw;
+            }
 #else
+            LastStatus = "Editor mock detector initialized";
+            LastError = string.Empty;
             await Task.CompletedTask;
 #endif
         }
@@ -43,34 +61,50 @@ namespace HoloFaceRecognition
         public async Task<List<FaceDetectionResult>> DetectAsync(CameraFrame frame)
         {
             var results = new List<FaceDetectionResult>();
+            LastDetectedFaceCount = 0;
 
             if (frame == null || frame.pixels == null || frame.width <= 0 || frame.height <= 0)
+            {
+                LastStatus = "Detector skipped: invalid frame";
                 return results;
+            }
 
 #if WINDOWS_UWP && !UNITY_EDITOR
-            if (_detector == null)
-                await InitializeAsync();
-
-            using (SoftwareBitmap bitmap = CreateSoftwareBitmap(frame))
+            try
             {
-                var faces = await _detector.DetectFacesAsync(bitmap);
-                foreach (var face in faces)
+                if (_detector == null)
+                    await InitializeAsync();
+
+                using (SoftwareBitmap bitmap = CreateGray8SoftwareBitmap(frame))
                 {
-                    BitmapBounds box = face.FaceBox;
-                    results.Add(new FaceDetectionResult
+                    var faces = await _detector.DetectFacesAsync(bitmap);
+                    foreach (var face in faces)
                     {
-                        pixelRect = new Rect(box.X, box.Y, box.Width, box.Height),
-                        landmarks = null,
-                        confidence = 1f
-                    });
+                        BitmapBounds box = face.FaceBox;
+                        results.Add(new FaceDetectionResult
+                        {
+                            pixelRect = new Rect(box.X, box.Y, box.Width, box.Height),
+                            landmarks = null,
+                            confidence = 1f
+                        });
+                    }
                 }
+
+                LastDetectedFaceCount = results.Count;
+                LastStatus = "UWP detector faces=" + LastDetectedFaceCount;
+                LastError = string.Empty;
+            }
+            catch (Exception ex)
+            {
+                LastStatus = "UWP detector failed";
+                LastError = ex.GetType().Name + ": " + ex.Message;
+                UnityEngine.Debug.LogException(ex);
             }
 #else
             await Task.CompletedTask;
 
             // Unity Editor / PC fallback:
             // Return a mock face box in the center of the frame.
-            // This is only for testing the pipeline before deploying to HoloLens.
             float boxW = frame.width * 0.42f;
             float boxH = frame.height * 0.62f;
             float boxX = (frame.width - boxW) * 0.5f;
@@ -82,32 +116,32 @@ namespace HoloFaceRecognition
                 landmarks = null,
                 confidence = 1f
             });
+
+            LastDetectedFaceCount = results.Count;
+            LastStatus = "Mock detector faces=" + LastDetectedFaceCount;
+            LastError = string.Empty;
 #endif
 
             return results;
         }
 
 #if WINDOWS_UWP && !UNITY_EDITOR
-        static SoftwareBitmap CreateSoftwareBitmap(CameraFrame frame)
+        static SoftwareBitmap CreateGray8SoftwareBitmap(CameraFrame frame)
         {
             var bitmap = new SoftwareBitmap(
-                BitmapPixelFormat.Bgra8,
+                BitmapPixelFormat.Gray8,
                 frame.width,
                 frame.height,
-                BitmapAlphaMode.Premultiplied
+                BitmapAlphaMode.Ignore
             );
 
-            byte[] bytes = new byte[frame.width * frame.height * 4];
+            byte[] bytes = new byte[frame.width * frame.height];
             int length = Math.Min(frame.pixels.Length, frame.width * frame.height);
 
             for (int i = 0; i < length; i++)
             {
                 Color32 c = frame.pixels[i];
-                int o = i * 4;
-                bytes[o + 0] = c.b;
-                bytes[o + 1] = c.g;
-                bytes[o + 2] = c.r;
-                bytes[o + 3] = 255;
+                bytes[i] = (byte)((c.r * 299 + c.g * 587 + c.b * 114) / 1000);
             }
 
             bitmap.CopyFromBuffer(bytes.AsBuffer());

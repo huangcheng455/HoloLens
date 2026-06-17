@@ -8,6 +8,10 @@ using UnityEngine;
 using UnityEngine.Networking;
 using UnityEngine.UI;
 
+#if (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+using UnityEngine.XR.WSA.Input;
+#endif
+
 namespace HoloFaceRecognition
 {
     [Serializable]
@@ -38,6 +42,10 @@ namespace HoloFaceRecognition
         [Range(0f, 1f)] public float threshold = 0.5f;
         public float bboxPadding = 0.25f;
 
+        [Header("HoloLens Test")]
+        public bool enableAirTapRegister = true;
+        public string hololensDefaultRegisterName = "HoloLensUser";
+
         readonly FaceAligner _aligner = new FaceAligner();
         readonly FaceMatcher _matcher = new FaceMatcher();
         readonly FaceDetectorService _detector = new FaceDetectorService();
@@ -47,28 +55,52 @@ namespace HoloFaceRecognition
 
         bool _initialized;
         bool _processing;
+        bool _pendingAirTapRegister;
         int _frameCounter;
         float _fpsTimer;
         int _fpsFrames;
         float _fps;
         float _lastPipelineMs;
         float[] _lastEmbedding;
+        string _initStatus = "Not initialized";
+        string _lastError = string.Empty;
+        string _lastInteractionStatus = string.Empty;
         GameObject _popupRoot;
         Text _popupText;
         Coroutine _popupRoutine;
 
+#if (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+        GestureRecognizer _tapRecognizer;
+#endif
+
         void Awake()
         {
+            Screen.sleepTimeout = SleepTimeout.NeverSleep;
+            EnsureDebugTextReadable();
             EnsureRegistrationUi();
+            InitializeAirTapRegister();
         }
 
         async void Start()
         {
-            await InitializeAsync();
+            try
+            {
+                await InitializeAsync();
+            }
+            catch (Exception ex)
+            {
+                _initialized = false;
+                _initStatus = "Init failed";
+                _lastError = ex.GetType().Name + ": " + ex.Message;
+                UnityEngine.Debug.LogException(ex);
+                SetStatusText(_lastError);
+            }
         }
 
         void OnDestroy()
         {
+            Screen.sleepTimeout = SleepTimeout.SystemSetting;
+            DisposeAirTapRegister();
             _recognizer.Dispose();
         }
 
@@ -76,6 +108,17 @@ namespace HoloFaceRecognition
         {
             _matcher.Threshold = threshold;
             UpdateFps();
+
+#if UNITY_EDITOR
+            if (Input.GetKeyDown(KeyCode.R))
+                RegisterCurrentFaceForHoloLensTest();
+#endif
+
+            if (_pendingAirTapRegister)
+            {
+                _pendingAirTapRegister = false;
+                RegisterCurrentFaceForHoloLensTest();
+            }
 
             if (!_initialized || _processing || cameraReader == null || !cameraReader.TryGetLatestFrame(out var frame))
             {
@@ -92,12 +135,23 @@ namespace HoloFaceRecognition
 
         async Task InitializeAsync()
         {
+            _initStatus = "Loading database...";
             await _database.LoadAsync();
+
+            _initStatus = "Initializing detector...";
             await _detector.InitializeAsync();
 
+            _initStatus = "Initializing recognizer...";
+#if USE_ONNXRUNTIME
             string modelPath = await PrepareModelFileAsync(modelFileName);
             await _recognizer.InitializeAsync(modelPath, modelName);
+#else
+            await _recognizer.InitializeAsync(modelFileName, modelName);
+#endif
+
             _initialized = true;
+            _initStatus = "Initialized";
+            _lastError = string.Empty;
         }
 
         static async Task<string> PrepareModelFileAsync(string fileName)
@@ -172,9 +226,12 @@ namespace HoloFaceRecognition
 
                 if (overlayRenderer != null)
                     overlayRenderer.SetFaces(_latestResults, frame.width, frame.height);
+
+                _lastError = string.Empty;
             }
             catch (Exception ex)
             {
+                _lastError = "Pipeline " + ex.GetType().Name + ": " + ex.Message;
                 UnityEngine.Debug.LogException(ex);
             }
             finally
@@ -190,12 +247,14 @@ namespace HoloFaceRecognition
             if (string.IsNullOrEmpty(personName))
             {
                 UnityEngine.Debug.LogWarning("Cannot register face: name is empty.");
+                SetStatusText("Cannot register: name is empty");
                 return;
             }
 
             if (_lastEmbedding == null)
             {
                 UnityEngine.Debug.LogWarning("No face embedding is available yet.");
+                SetStatusText("No face embedding available");
                 return;
             }
 
@@ -221,7 +280,27 @@ namespace HoloFaceRecognition
             }
 
             RegisterCurrentFace(personName);
-            SetStatusText(string.Empty);
+            SetStatusText("Registered: " + personName);
+            ShowPopup("Registered: " + personName);
+        }
+
+        public void RegisterCurrentFaceForHoloLensTest()
+        {
+            string personName = registerNameInput == null ? string.Empty : registerNameInput.text.Trim();
+            if (string.IsNullOrEmpty(personName))
+                personName = string.IsNullOrWhiteSpace(hololensDefaultRegisterName) ? "HoloLensUser" : hololensDefaultRegisterName.Trim();
+
+            _lastInteractionStatus = "Air tap register triggered";
+
+            if (_latestResults.Count == 0 || _lastEmbedding == null)
+            {
+                SetStatusText("Air tap: no face available");
+                ShowPopup("No face available");
+                return;
+            }
+
+            RegisterCurrentFace(personName);
+            SetStatusText("Air tap registered: " + personName);
             ShowPopup("Registered: " + personName);
         }
 
@@ -416,12 +495,127 @@ namespace HoloFaceRecognition
             if (statsText == null)
                 return;
 
+            string cameraLine = "Camera: missing";
+            if (cameraReader != null)
+            {
+                cameraLine = string.Format(
+                    "Camera: {0} {1}x{2} frames={3} perm={4}",
+                    cameraReader.IsRunning ? "running" : "not running",
+                    cameraReader.FrameWidth,
+                    cameraReader.FrameHeight,
+                    cameraReader.FrameCount,
+                    cameraReader.PermissionGranted ? "yes" : "no");
+            }
+
+            string cameraStatus = cameraReader != null ? cameraReader.LastStatus : string.Empty;
+            string detectorStatus = _detector.LastStatus;
+            string error = BuildErrorLine();
+
             statsText.text = string.Format(
-                "FPS: {0:0.0}\nFaces: {1}\nPipeline: {2:0.0} ms\nONNX: {3:0.0} ms",
+                "Init: {0}\n{1}\n{2}\nDetector: {3}\nFPS: {4:0.0} Faces: {5} Pipeline: {6:0.0} ms ONNX: {7:0.0} ms\nDB: {8} people / {9} embeddings {10}{11}",
+                _initStatus,
+                cameraLine,
+                cameraStatus,
+                detectorStatus,
                 _fps,
                 _latestResults.Count,
                 _lastPipelineMs,
-                _recognizer.LastInferenceMs);
+                _recognizer.LastInferenceMs,
+                GetPersonCount(),
+                GetEmbeddingCount(),
+                string.IsNullOrEmpty(_lastInteractionStatus) ? string.Empty : "\n" + _lastInteractionStatus,
+                string.IsNullOrEmpty(error) ? string.Empty : "\n" + error);
         }
+
+        string BuildErrorLine()
+        {
+            if (!string.IsNullOrEmpty(_lastError))
+                return "Error: " + _lastError;
+
+            if (cameraReader != null && !string.IsNullOrEmpty(cameraReader.LastError))
+                return "Camera error: " + cameraReader.LastError;
+
+            if (!string.IsNullOrEmpty(_detector.LastError))
+                return "Detector error: " + _detector.LastError;
+
+            return string.Empty;
+        }
+
+        int GetPersonCount()
+        {
+            return _database.Data != null && _database.Data.people != null ? _database.Data.people.Count : 0;
+        }
+
+        int GetEmbeddingCount()
+        {
+            int count = 0;
+            if (_database.Data == null || _database.Data.people == null)
+                return 0;
+
+            foreach (var person in _database.Data.people)
+            {
+                if (person != null && person.embeddings != null)
+                    count += person.embeddings.Count;
+            }
+
+            return count;
+        }
+
+        void EnsureDebugTextReadable()
+        {
+            if (statsText == null)
+                return;
+
+            statsText.fontSize = Mathf.Min(statsText.fontSize, 22);
+            statsText.horizontalOverflow = HorizontalWrapMode.Overflow;
+            statsText.verticalOverflow = VerticalWrapMode.Overflow;
+
+            RectTransform rect = statsText.rectTransform;
+            if (rect != null)
+                rect.sizeDelta = new Vector2(Mathf.Max(rect.sizeDelta.x, 980f), Mathf.Max(rect.sizeDelta.y, 260f));
+        }
+
+        void InitializeAirTapRegister()
+        {
+#if (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+            if (!enableAirTapRegister)
+                return;
+
+            try
+            {
+                _tapRecognizer = new GestureRecognizer();
+                _tapRecognizer.SetRecognizableGestures(GestureSettings.Tap);
+                _tapRecognizer.Tapped += OnAirTapped;
+                _tapRecognizer.StartCapturingGestures();
+                _lastInteractionStatus = "Air tap register enabled";
+            }
+            catch (Exception ex)
+            {
+                _lastInteractionStatus = "Air tap init failed";
+                _lastError = ex.GetType().Name + ": " + ex.Message;
+                UnityEngine.Debug.LogException(ex);
+            }
+#endif
+        }
+
+        void DisposeAirTapRegister()
+        {
+#if (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+            if (_tapRecognizer == null)
+                return;
+
+            _tapRecognizer.Tapped -= OnAirTapped;
+            _tapRecognizer.StopCapturingGestures();
+            _tapRecognizer.Dispose();
+            _tapRecognizer = null;
+#endif
+        }
+
+#if (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+        void OnAirTapped(TappedEventArgs args)
+        {
+            _pendingAirTapRegister = true;
+        }
+#endif
     }
 }

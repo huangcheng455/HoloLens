@@ -39,7 +39,9 @@ namespace HoloFaceRecognition
             ModelName = string.IsNullOrEmpty(modelName) ? Path.GetFileNameWithoutExtension(modelPath) : modelName;
 
 #if USE_ONNXRUNTIME
-            string resolvedModelPath = Path.Combine(Application.streamingAssetsPath, DefaultModelFileName);
+            string resolvedModelPath = string.IsNullOrEmpty(modelPath)
+                ? Path.Combine(Application.streamingAssetsPath, DefaultModelFileName)
+                : modelPath;
             if (!File.Exists(resolvedModelPath))
             {
                 string message = "ONNX model file not found. Expected path: " + resolvedModelPath;
