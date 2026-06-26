@@ -42,9 +42,14 @@ namespace HoloFaceRecognition
         [Range(0f, 1f)] public float threshold = 0.5f;
         public float bboxPadding = 0.25f;
 
+        [Header("Debug")]
+        public bool enablePipelineDebugMode = true;
+        public bool logPipelineSteps = true;
+
         [Header("HoloLens Test")]
         public bool enableAirTapRegister = true;
         public string hololensDefaultRegisterName = "HoloLensUser";
+        public bool createLegacyClearDatabaseButton;
 
         readonly FaceAligner _aligner = new FaceAligner();
         readonly FaceMatcher _matcher = new FaceMatcher();
@@ -54,6 +59,8 @@ namespace HoloFaceRecognition
         readonly List<RecognizedFace> _latestResults = new List<RecognizedFace>();
 
         bool _initialized;
+        bool _detectorInitialized;
+        bool _recognizerInitialized;
         bool _processing;
         bool _pendingAirTapRegister;
         int _frameCounter;
@@ -61,10 +68,21 @@ namespace HoloFaceRecognition
         int _fpsFrames;
         float _fps;
         float _lastPipelineMs;
+        float _lastCameraFrameMs;
+        float _lastDetectorMs;
+        float _lastCropMs;
+        float _lastEmbeddingMs;
+        float _lastDbMatchMs;
+        float _lastRegisterDbMs;
         float[] _lastEmbedding;
         string _initStatus = "Not initialized";
+        string _onnxStatus = "ONNX: NOT STARTED";
+        string _lastPipelineStage = "Pipeline: idle";
+        string _lastMatchStatus = "Match: not run";
+        float _onnxInitMs;
         string _lastError = string.Empty;
         string _lastInteractionStatus = string.Empty;
+        bool _lastRegisterSucceeded;
         GameObject _popupRoot;
         Text _popupText;
         Coroutine _popupRoutine;
@@ -120,8 +138,19 @@ namespace HoloFaceRecognition
                 RegisterCurrentFaceForHoloLensTest();
             }
 
-            if (!_initialized || _processing || cameraReader == null || !cameraReader.TryGetLatestFrame(out var frame))
+            if (!_initialized || !_detectorInitialized || _processing || cameraReader == null)
             {
+                UpdateStatsText();
+                return;
+            }
+
+            var cameraFrameSw = Stopwatch.StartNew();
+            bool hasFrame = cameraReader.TryGetLatestFrame(out var frame);
+            cameraFrameSw.Stop();
+            _lastCameraFrameMs = (float)cameraFrameSw.Elapsed.TotalMilliseconds;
+            if (!hasFrame)
+            {
+                _lastPipelineStage = "CameraFrame: waiting";
                 UpdateStatsText();
                 return;
             }
@@ -140,18 +169,60 @@ namespace HoloFaceRecognition
 
             _initStatus = "Initializing detector...";
             await _detector.InitializeAsync();
+            _detectorInitialized = true;
 
             _initStatus = "Initializing recognizer...";
+            _onnxStatus = "ONNX: INITIALIZING...";
+            _onnxInitMs = 0f;
+            var recognizerInitSw = Stopwatch.StartNew();
+            try
+            {
 #if USE_ONNXRUNTIME
-            string modelPath = await PrepareModelFileAsync(modelFileName);
-            await _recognizer.InitializeAsync(modelPath, modelName);
+                string modelPath = await PrepareModelFileAsync(modelFileName);
+                await _recognizer.InitializeAsync(modelPath, modelName);
+                recognizerInitSw.Stop();
+                _onnxInitMs = (float)recognizerInitSw.Elapsed.TotalMilliseconds;
+                _recognizerInitialized = true;
+                _onnxStatus = "Recognizer: READY";
+                UnityEngine.Debug.Log("Recognizer: READY. ONNX init time: " + _onnxInitMs.ToString("0.0") + " ms");
 #else
-            await _recognizer.InitializeAsync(modelFileName, modelName);
+                recognizerInitSw.Stop();
+                _onnxInitMs = (float)recognizerInitSw.Elapsed.TotalMilliseconds;
+                _recognizerInitialized = false;
+                _onnxStatus = "ONNX: DISABLED (mock mode)";
+                UnityEngine.Debug.LogWarning("ONNX: DISABLED (mock mode). USE_ONNXRUNTIME is not defined; recognition is disabled to avoid silent mock embeddings.");
 #endif
+            }
+            catch (Exception ex)
+            {
+                recognizerInitSw.Stop();
+                _onnxInitMs = (float)recognizerInitSw.Elapsed.TotalMilliseconds;
+                _recognizerInitialized = false;
+                _onnxStatus = "ONNX: FAILED - " + BuildOnnxInitError(ex);
+                _lastError = _onnxStatus;
+                UnityEngine.Debug.LogWarning(_lastError);
+                UnityEngine.Debug.LogException(ex);
+            }
 
             _initialized = true;
-            _initStatus = "Initialized";
-            _lastError = string.Empty;
+            _initStatus = _recognizerInitialized ? "Initialized" : "Detection only";
+        }
+
+        static string BuildOnnxInitError(Exception ex)
+        {
+            if (ex is DllNotFoundException)
+                return "DLL missing: " + ex.Message;
+
+            if (ex is FileNotFoundException fileNotFound)
+                return "model not found: " + (string.IsNullOrEmpty(fileNotFound.FileName) ? fileNotFound.Message : fileNotFound.FileName);
+
+            if (ex is BadImageFormatException)
+                return "DLL architecture mismatch: " + ex.Message;
+
+            if (ex is TypeInitializationException)
+                return "runtime initialization failed: " + ex.Message;
+
+            return ex.GetType().Name + ": " + ex.Message;
         }
 
         static async Task<string> PrepareModelFileAsync(string fileName)
@@ -197,37 +268,157 @@ namespace HoloFaceRecognition
         {
             _processing = true;
             var sw = Stopwatch.StartNew();
+            _lastDetectorMs = 0f;
+            _lastCropMs = 0f;
+            _lastEmbeddingMs = 0f;
+            _lastDbMatchMs = 0f;
+            _lastPipelineStage = "CameraFrame: received";
+            PipelineLog("CameraFrame received: " + frame.width + "x" + frame.height + ", rotation=" + frame.rotationAngle + ", mirror=" + frame.verticallyMirrored);
 
             try
             {
-                List<FaceDetectionResult> detections = await _detector.DetectAsync(frame);
+                bool pipelineHadError = false;
+                List<FaceDetectionResult> detections;
+                var detectorSw = Stopwatch.StartNew();
+                try
+                {
+                    _lastPipelineStage = "Detector: running";
+                    detections = await _detector.DetectAsync(frame);
+                    detectorSw.Stop();
+                    _lastDetectorMs = (float)detectorSw.Elapsed.TotalMilliseconds;
+                    _lastPipelineStage = "Detector: ok";
+                    PipelineLog("Detector OK: faces=" + detections.Count + ", time=" + _lastDetectorMs.ToString("0.0") + " ms");
+                }
+                catch (Exception ex)
+                {
+                    detectorSw.Stop();
+                    _lastDetectorMs = (float)detectorSw.Elapsed.TotalMilliseconds;
+                    _lastError = "Detector failed: " + ex.GetType().Name + ": " + ex.Message;
+                    _lastPipelineStage = "Detector: failed";
+                    UnityEngine.Debug.LogError(_lastError);
+                    throw;
+                }
+
                 var recognized = new List<RecognizedFace>();
                 if (detections.Count == 0)
+                {
                     _lastEmbedding = null;
+                    _lastMatchStatus = "Match: skipped, no face";
+                    PipelineLog("Pipeline stopped: no face detected.");
+                }
 
                 foreach (var detection in detections)
                 {
-                    Color32[] aligned = _aligner.Align(frame, detection, bboxPadding);
-                    float[] embedding = await _recognizer.ExtractEmbeddingAsync(aligned);
-                    _lastEmbedding = embedding;
-
-                    FaceMatchResult match = _matcher.Match(embedding, _database);
-                    recognized.Add(new RecognizedFace
+                    var recognizedFace = new RecognizedFace
                     {
                         pixelRect = detection.pixelRect,
-                        name = match.name,
-                        similarity = match.similarity,
+                        name = _recognizerInitialized ? "Recognizing..." : "Face",
+                        similarity = 0f,
                         detectionConfidence = detection.confidence
-                    });
+                    };
+
+                    if (_recognizerInitialized)
+                    {
+                        Color32[] aligned = null;
+                        try
+                        {
+                            var cropSw = Stopwatch.StartNew();
+                            _lastPipelineStage = "Crop: running";
+                            aligned = _aligner.Align(frame, detection, bboxPadding);
+                            cropSw.Stop();
+                            _lastCropMs += (float)cropSw.Elapsed.TotalMilliseconds;
+                            if (aligned == null || aligned.Length == 0)
+                                throw new InvalidOperationException("Crop produced empty pixels.");
+                            PipelineLog("Crop OK: pixels=" + aligned.Length + ", time=" + cropSw.Elapsed.TotalMilliseconds.ToString("0.0") + " ms");
+                        }
+                        catch (Exception ex)
+                        {
+                            _lastEmbedding = null;
+                            recognizedFace.name = "Crop failed";
+                            recognizedFace.similarity = 0f;
+                            _lastError = "Crop failed: " + ex.GetType().Name + ": " + ex.Message;
+                            _lastPipelineStage = "Crop: failed";
+                            pipelineHadError = true;
+                            UnityEngine.Debug.LogError(_lastError);
+                            UnityEngine.Debug.LogException(ex);
+                            recognized.Add(recognizedFace);
+                            continue;
+                        }
+
+                        try
+                        {
+                            var embeddingSw = Stopwatch.StartNew();
+                            _lastPipelineStage = "ONNX embedding: running";
+                            float[] embedding = await _recognizer.ExtractEmbeddingAsync(aligned);
+                            embeddingSw.Stop();
+                            _lastEmbeddingMs += (float)embeddingSw.Elapsed.TotalMilliseconds;
+                            if (embedding == null || embedding.Length == 0)
+                                throw new InvalidOperationException("Recognizer produced empty embedding.");
+                            _lastEmbedding = embedding;
+                            PipelineLog("ONNX embedding OK: dim=" + embedding.Length + ", time=" + embeddingSw.Elapsed.TotalMilliseconds.ToString("0.0") + " ms");
+
+                        }
+                        catch (Exception ex)
+                        {
+                            _recognizerInitialized = false;
+                            _lastEmbedding = null;
+                            recognizedFace.name = "ONNX failed";
+                            recognizedFace.similarity = 0f;
+                            _lastError = "ONNX embedding failed: " + ex.GetType().Name + ": " + ex.Message;
+                            _onnxStatus = "ONNX: FAILED - " + ex.GetType().Name + ": " + ex.Message;
+                            _lastPipelineStage = "ONNX embedding: failed";
+                            pipelineHadError = true;
+                            UnityEngine.Debug.LogError(_lastError);
+                            UnityEngine.Debug.LogException(ex);
+                        }
+
+                        if (_lastEmbedding != null)
+                        {
+                            try
+                            {
+                                var matchSw = Stopwatch.StartNew();
+                                _lastPipelineStage = "DB match: running";
+                                FaceMatchResult match = _matcher.Match(_lastEmbedding, _database);
+                                matchSw.Stop();
+                                _lastDbMatchMs += (float)matchSw.Elapsed.TotalMilliseconds;
+                                recognizedFace.name = match.name;
+                                recognizedFace.similarity = match.similarity;
+                                _lastMatchStatus = string.Format("Match: {0} sim={1:0.000}", match.name, match.similarity);
+                                _lastPipelineStage = "Match: ok";
+                                PipelineLog("DB match OK: name=" + match.name + ", similarity=" + match.similarity.ToString("0.000") + ", known=" + match.isKnown + ", time=" + matchSw.Elapsed.TotalMilliseconds.ToString("0.0") + " ms");
+                            }
+                            catch (Exception ex)
+                            {
+                                _lastEmbedding = null;
+                                recognizedFace.name = "Match failed";
+                                recognizedFace.similarity = 0f;
+                                _lastError = "DB match failed: " + ex.GetType().Name + ": " + ex.Message;
+                                _lastMatchStatus = "Match: failed";
+                                _lastPipelineStage = "DB match: failed";
+                                pipelineHadError = true;
+                                UnityEngine.Debug.LogError(_lastError);
+                                UnityEngine.Debug.LogException(ex);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _lastEmbedding = null;
+                        _lastMatchStatus = "Match: skipped, ONNX unavailable";
+                        PipelineLog("ONNX embedding skipped: recognizer is not initialized.");
+                    }
+
+                    recognized.Add(recognizedFace);
                 }
 
                 _latestResults.Clear();
                 _latestResults.AddRange(recognized);
 
                 if (overlayRenderer != null)
-                    overlayRenderer.SetFaces(_latestResults, frame.width, frame.height);
+                    overlayRenderer.SetFaces(_latestResults, frame);
 
-                _lastError = string.Empty;
+                if (_recognizerInitialized && !pipelineHadError)
+                    _lastError = string.Empty;
             }
             catch (Exception ex)
             {
@@ -243,6 +434,7 @@ namespace HoloFaceRecognition
 
         public void RegisterCurrentFace(string personName)
         {
+            _lastRegisterSucceeded = false;
             personName = personName == null ? string.Empty : personName.Trim();
             if (string.IsNullOrEmpty(personName))
             {
@@ -253,13 +445,36 @@ namespace HoloFaceRecognition
 
             if (_lastEmbedding == null)
             {
-                UnityEngine.Debug.LogWarning("No face embedding is available yet.");
-                SetStatusText("No face embedding available");
+                string message = _recognizerInitialized
+                    ? "No face embedding available"
+                    : "Detection works, but recognition is unavailable. Add UWP ARM64 ONNX Runtime to register faces.";
+                UnityEngine.Debug.LogWarning(message);
+                SetStatusText(message);
                 return;
             }
 
-            _database.AddEmbedding(personName, _lastEmbedding, _recognizer.ModelName);
-            _database.Save();
+            var registerSw = Stopwatch.StartNew();
+            try
+            {
+                _database.AddEmbedding(personName, _lastEmbedding, _recognizer.ModelName);
+                _database.Save();
+                registerSw.Stop();
+                _lastRegisterDbMs = (float)registerSw.Elapsed.TotalMilliseconds;
+                _lastRegisterSucceeded = true;
+                _lastInteractionStatus = "Registered " + personName + " (" + _lastRegisterDbMs.ToString("0.0") + " ms)";
+                PipelineLog("DB register OK: name=" + personName + ", embeddings=" + GetEmbeddingCount() + ", time=" + _lastRegisterDbMs.ToString("0.0") + " ms");
+            }
+            catch (Exception ex)
+            {
+                registerSw.Stop();
+                _lastRegisterDbMs = (float)registerSw.Elapsed.TotalMilliseconds;
+                _lastError = "DB register failed: " + ex.GetType().Name + ": " + ex.Message;
+                _lastInteractionStatus = "Register failed at DB";
+                UnityEngine.Debug.LogError(_lastError);
+                UnityEngine.Debug.LogException(ex);
+                SetStatusText(_lastError);
+                throw;
+            }
         }
 
         public void RegisterCurrentFaceFromUI()
@@ -274,14 +489,27 @@ namespace HoloFaceRecognition
 
             if (_latestResults.Count == 0 || _lastEmbedding == null)
             {
-                UnityEngine.Debug.LogWarning("No face available.");
-                SetStatusText("No face available");
+                string message = _latestResults.Count == 0
+                    ? "No face available"
+                    : "Face detected, but recognition is unavailable. Add UWP ARM64 ONNX Runtime to register.";
+                UnityEngine.Debug.LogWarning(message);
+                SetStatusText(message);
                 return;
             }
 
-            RegisterCurrentFace(personName);
-            SetStatusText("Registered: " + personName);
-            ShowPopup("Registered: " + personName);
+            try
+            {
+                RegisterCurrentFace(personName);
+                if (_lastRegisterSucceeded)
+                {
+                    SetStatusText("Registered: " + personName);
+                    ShowPopup("Registered: " + personName);
+                }
+            }
+            catch (Exception)
+            {
+                ShowPopup("Register failed: DB error");
+            }
         }
 
         public void RegisterCurrentFaceForHoloLensTest()
@@ -294,14 +522,27 @@ namespace HoloFaceRecognition
 
             if (_latestResults.Count == 0 || _lastEmbedding == null)
             {
-                SetStatusText("Air tap: no face available");
-                ShowPopup("No face available");
+                string message = _latestResults.Count == 0
+                    ? "Air tap: no face available"
+                    : "Face detected, recognition unavailable";
+                SetStatusText(message);
+                ShowPopup(message);
                 return;
             }
 
-            RegisterCurrentFace(personName);
-            SetStatusText("Air tap registered: " + personName);
-            ShowPopup("Registered: " + personName);
+            try
+            {
+                RegisterCurrentFace(personName);
+                if (_lastRegisterSucceeded)
+                {
+                    SetStatusText("Air tap registered: " + personName);
+                    ShowPopup("Registered: " + personName);
+                }
+            }
+            catch (Exception)
+            {
+                ShowPopup("Register failed: DB error");
+            }
         }
 
         public void ClearFaceDatabaseFromUI()
@@ -345,7 +586,7 @@ namespace HoloFaceRecognition
             if (clearDatabaseButton == null)
                 clearDatabaseButton = FindButton("ClearDatabaseButton");
 
-            if (clearDatabaseButton == null)
+            if (clearDatabaseButton == null && createLegacyClearDatabaseButton)
             {
                 clearDatabaseButton = CreateClearDatabaseButton(registerButton);
                 createdClearButton = clearDatabaseButton != null;
@@ -499,32 +740,50 @@ namespace HoloFaceRecognition
             if (cameraReader != null)
             {
                 cameraLine = string.Format(
-                    "Camera: {0} {1}x{2} frames={3} perm={4}",
+                    "Camera: {0} {1}x{2} frames={3} perm={4} rotation={5} mirror={6} | {7}",
                     cameraReader.IsRunning ? "running" : "not running",
                     cameraReader.FrameWidth,
                     cameraReader.FrameHeight,
                     cameraReader.FrameCount,
-                    cameraReader.PermissionGranted ? "yes" : "no");
+                    cameraReader.PermissionGranted ? "yes" : "no",
+                    cameraReader.RotationAngle,
+                    cameraReader.VerticallyMirrored ? "vertical" : "none",
+                    cameraReader.LastStatus);
             }
 
-            string cameraStatus = cameraReader != null ? cameraReader.LastStatus : string.Empty;
             string detectorStatus = _detector.LastStatus;
             string error = BuildErrorLine();
-
-            statsText.text = string.Format(
-                "Init: {0}\n{1}\n{2}\nDetector: {3}\nFPS: {4:0.0} Faces: {5} Pipeline: {6:0.0} ms ONNX: {7:0.0} ms\nDB: {8} people / {9} embeddings {10}{11}",
-                _initStatus,
-                cameraLine,
-                cameraStatus,
-                detectorStatus,
+            string detectorLine = string.Format("Detector: {0} faces={1}", detectorStatus, _latestResults.Count);
+            string onnxLine = string.Format("ONNX status: {0} init={1:0.0} ms", _onnxStatus, _onnxInitMs);
+            if (!string.IsNullOrEmpty(error))
+                onnxLine += " | " + error;
+            string latencyLine = string.Format(
+                "FPS: {0:0.0} latency={1:0.0} ms inference={2:0.0} ms DB={3}/{4}",
                 _fps,
-                _latestResults.Count,
                 _lastPipelineMs,
                 _recognizer.LastInferenceMs,
                 GetPersonCount(),
-                GetEmbeddingCount(),
-                string.IsNullOrEmpty(_lastInteractionStatus) ? string.Empty : "\n" + _lastInteractionStatus,
-                string.IsNullOrEmpty(error) ? string.Empty : "\n" + error);
+                GetEmbeddingCount());
+            if (enablePipelineDebugMode)
+            {
+                latencyLine += string.Format(
+                    " | {0} | cam={1:0.0} det={2:0.0} crop={3:0.0} onnx={4:0.0} match={5:0.0} regdb={6:0.0} ms | {7}",
+                    _lastPipelineStage,
+                    _lastCameraFrameMs,
+                    _lastDetectorMs,
+                    _lastCropMs,
+                    _lastEmbeddingMs,
+                    _lastDbMatchMs,
+                    _lastRegisterDbMs,
+                    _lastMatchStatus);
+            }
+
+            statsText.text = string.Format(
+                "{0}\n{1}\n{2}\n{3}",
+                cameraLine,
+                detectorLine,
+                onnxLine,
+                string.IsNullOrEmpty(_lastInteractionStatus) ? latencyLine : latencyLine + " | " + _lastInteractionStatus);
         }
 
         string BuildErrorLine()
@@ -539,6 +798,12 @@ namespace HoloFaceRecognition
                 return "Detector error: " + _detector.LastError;
 
             return string.Empty;
+        }
+
+        void PipelineLog(string message)
+        {
+            if (enablePipelineDebugMode && logPipelineSteps)
+                UnityEngine.Debug.Log("[FacePipeline] " + message);
         }
 
         int GetPersonCount()
@@ -566,13 +831,54 @@ namespace HoloFaceRecognition
             if (statsText == null)
                 return;
 
-            statsText.fontSize = Mathf.Min(statsText.fontSize, 22);
+            statsText.fontSize = Mathf.Max(statsText.fontSize, 28);
+            statsText.color = Color.white;
+            statsText.alignment = TextAnchor.UpperLeft;
             statsText.horizontalOverflow = HorizontalWrapMode.Overflow;
             statsText.verticalOverflow = VerticalWrapMode.Overflow;
+            EnsureStatsBackgroundPanel();
 
             RectTransform rect = statsText.rectTransform;
             if (rect != null)
-                rect.sizeDelta = new Vector2(Mathf.Max(rect.sizeDelta.x, 980f), Mathf.Max(rect.sizeDelta.y, 260f));
+                rect.sizeDelta = new Vector2(Mathf.Max(rect.sizeDelta.x, 1040f), Mathf.Max(rect.sizeDelta.y, 180f));
+        }
+
+        void EnsureStatsBackgroundPanel()
+        {
+            RectTransform textRect = statsText.rectTransform;
+            if (textRect == null || textRect.parent == null)
+                return;
+
+            const string panelName = "StatsTextBackgroundPanel";
+            Transform existing = textRect.parent.Find(panelName);
+            RectTransform panelRect;
+            Image panelImage;
+
+            if (existing == null)
+            {
+                var panel = new GameObject(panelName, typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+                panel.layer = statsText.gameObject.layer;
+                panel.transform.SetParent(textRect.parent, false);
+                panel.transform.SetSiblingIndex(textRect.GetSiblingIndex());
+                panelRect = panel.GetComponent<RectTransform>();
+                panelImage = panel.GetComponent<Image>();
+            }
+            else
+            {
+                panelRect = existing as RectTransform;
+                panelImage = existing.GetComponent<Image>();
+            }
+
+            if (panelRect == null || panelImage == null)
+                return;
+
+            panelRect.anchorMin = textRect.anchorMin;
+            panelRect.anchorMax = textRect.anchorMax;
+            panelRect.pivot = textRect.pivot;
+            panelRect.anchoredPosition = textRect.anchoredPosition;
+            panelRect.sizeDelta = new Vector2(Mathf.Max(textRect.sizeDelta.x, 1040f), Mathf.Max(textRect.sizeDelta.y, 180f));
+            panelImage.color = new Color(0f, 0f, 0f, 0.5f);
+            panelImage.raycastTarget = false;
         }
 
         void InitializeAirTapRegister()
