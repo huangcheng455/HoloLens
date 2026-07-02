@@ -33,7 +33,12 @@ namespace HoloFaceRecognition
         string _lastLoggedStatus = string.Empty;
 
 #if WINDOWS_UWP && !UNITY_EDITOR
+        const int DetectionLongSide = 320;
+        const int RotationFallbackAfterMisses = 3;
+
         FaceDetector _detector;
+        int _lastSuccessfulRotation = int.MinValue;
+        int _missesSinceRotationHit;
 #endif
 
         public async Task InitializeAsync()
@@ -79,12 +84,13 @@ namespace HoloFaceRecognition
                     await InitializeAsync();
 
                 int rotationUsed = 0;
+                DetectionBitmapInfo detectionBitmapInfo = new DetectionBitmapInfo();
                 IList<DetectedFace> detectedFaces = null;
                 int[] rotationAttempts = BuildRotationAttempts(frame.rotationAngle);
                 var attemptSummary = new List<string>();
                 foreach (int rotation in rotationAttempts)
                 {
-                    using (SoftwareBitmap bitmap = CreateGray8SoftwareBitmap(frame, rotation))
+                    using (SoftwareBitmap bitmap = CreateGray8SoftwareBitmap(frame, rotation, out detectionBitmapInfo))
                     {
                         detectedFaces = await _detector.DetectFacesAsync(bitmap);
                         int faceCount = detectedFaces == null ? 0 : detectedFaces.Count;
@@ -95,6 +101,16 @@ namespace HoloFaceRecognition
                     }
                 }
 
+                if (detectedFaces != null && detectedFaces.Count > 0)
+                {
+                    _lastSuccessfulRotation = rotationUsed;
+                    _missesSinceRotationHit = 0;
+                }
+                else
+                {
+                    _missesSinceRotationHit++;
+                }
+
                 if (detectedFaces != null)
                 {
                     foreach (var face in detectedFaces)
@@ -102,6 +118,8 @@ namespace HoloFaceRecognition
                         BitmapBounds box = face.FaceBox;
                         Rect pixelRect = MapDetectedRectToFrame(
                             new Rect(box.X, box.Y, box.Width, box.Height),
+                            detectionBitmapInfo.width,
+                            detectionBitmapInfo.height,
                             frame.width,
                             frame.height,
                             rotationUsed);
@@ -116,8 +134,8 @@ namespace HoloFaceRecognition
 
                 LastDetectedFaceCount = results.Count;
                 LastStatus = LastDetectedFaceCount > 0
-                    ? "faces detected: " + LastDetectedFaceCount + " rotation=" + rotationUsed + " attempts=" + string.Join(",", attemptSummary.ToArray())
-                    : "faces detected: 0 attempts=" + string.Join(",", attemptSummary.ToArray());
+                    ? "faces detected: " + LastDetectedFaceCount + " rotation=" + rotationUsed + " detect=" + detectionBitmapInfo.width + "x" + detectionBitmapInfo.height + " attempts=" + string.Join(",", attemptSummary.ToArray())
+                    : "faces detected: 0 detect=" + detectionBitmapInfo.width + "x" + detectionBitmapInfo.height + " attempts=" + string.Join(",", attemptSummary.ToArray());
                 LastError = string.Empty;
                 LogStatusChanged();
             }
@@ -163,24 +181,53 @@ namespace HoloFaceRecognition
         }
 
 #if WINDOWS_UWP && !UNITY_EDITOR
-        static int[] BuildRotationAttempts(int preferredRotation)
+        int[] BuildRotationAttempts(int preferredRotation)
         {
             int normalized = NormalizeRotation(preferredRotation);
-            var rotations = new List<int> { normalized, 0, 90, 270, 180 };
-            for (int i = rotations.Count - 1; i >= 0; i--)
-            {
-                if (rotations.IndexOf(rotations[i]) != i)
-                    rotations.RemoveAt(i);
-            }
 
+            if (_lastSuccessfulRotation != int.MinValue && _missesSinceRotationHit < RotationFallbackAfterMisses)
+                return new[] { _lastSuccessfulRotation };
+
+            var rotations = new List<int>();
+            AddUniqueRotation(rotations, _lastSuccessfulRotation);
+            AddUniqueRotation(rotations, normalized);
+            AddUniqueRotation(rotations, 0);
+            AddUniqueRotation(rotations, 90);
+            AddUniqueRotation(rotations, 270);
+            AddUniqueRotation(rotations, 180);
             return rotations.ToArray();
         }
 
-        static SoftwareBitmap CreateGray8SoftwareBitmap(CameraFrame frame, int rotation)
+        static void AddUniqueRotation(List<int> rotations, int rotation)
+        {
+            if (rotation == int.MinValue)
+                return;
+
+            int normalized = NormalizeRotation(rotation);
+            if (!rotations.Contains(normalized))
+                rotations.Add(normalized);
+        }
+
+        struct DetectionBitmapInfo
+        {
+            public int width;
+            public int height;
+        }
+
+        static SoftwareBitmap CreateGray8SoftwareBitmap(CameraFrame frame, int rotation, out DetectionBitmapInfo bitmapInfo)
         {
             int normalizedRotation = NormalizeRotation(rotation);
-            int bitmapWidth = normalizedRotation == 90 || normalizedRotation == 270 ? frame.height : frame.width;
-            int bitmapHeight = normalizedRotation == 90 || normalizedRotation == 270 ? frame.width : frame.height;
+            int fullRotatedWidth = normalizedRotation == 90 || normalizedRotation == 270 ? frame.height : frame.width;
+            int fullRotatedHeight = normalizedRotation == 90 || normalizedRotation == 270 ? frame.width : frame.height;
+            float scale = Mathf.Min(1f, DetectionLongSide / (float)Mathf.Max(fullRotatedWidth, fullRotatedHeight));
+            int bitmapWidth = Mathf.Max(1, Mathf.RoundToInt(fullRotatedWidth * scale));
+            int bitmapHeight = Mathf.Max(1, Mathf.RoundToInt(fullRotatedHeight * scale));
+            bitmapInfo = new DetectionBitmapInfo
+            {
+                width = bitmapWidth,
+                height = bitmapHeight
+            };
+
             var bitmap = new SoftwareBitmap(
                 BitmapPixelFormat.Gray8,
                 bitmapWidth,
@@ -189,50 +236,38 @@ namespace HoloFaceRecognition
             );
 
             byte[] bytes = new byte[bitmapWidth * bitmapHeight];
-            int length = Math.Min(frame.pixels.Length, frame.width * frame.height);
 
-            for (int i = 0; i < length; i++)
+            for (int targetY = 0; targetY < bitmapHeight; targetY++)
             {
-                int sourceX = i % frame.width;
-                int sourceY = i / frame.width;
-                int targetX;
-                int targetY;
-                MapFramePointToRotated(sourceX, sourceY, frame.width, frame.height, normalizedRotation, out targetX, out targetY);
-
-                Color32 c = frame.pixels[i];
-                bytes[targetY * bitmapWidth + targetX] = (byte)((c.r * 299 + c.g * 587 + c.b * 114) / 1000);
+                float rotatedY = (targetY + 0.5f) * fullRotatedHeight / bitmapHeight - 0.5f;
+                for (int targetX = 0; targetX < bitmapWidth; targetX++)
+                {
+                    float rotatedX = (targetX + 0.5f) * fullRotatedWidth / bitmapWidth - 0.5f;
+                    Vector2 source = MapRotatedPointToFrame(rotatedX, rotatedY, frame.width, frame.height, normalizedRotation);
+                    int sourceX = Mathf.Clamp(Mathf.RoundToInt(source.x), 0, frame.width - 1);
+                    int sourceY = Mathf.Clamp(Mathf.RoundToInt(source.y), 0, frame.height - 1);
+                    Color32 c = frame.pixels[sourceY * frame.width + sourceX];
+                    bytes[targetY * bitmapWidth + targetX] = (byte)((c.r * 299 + c.g * 587 + c.b * 114) / 1000);
+                }
             }
 
             bitmap.CopyFromBuffer(bytes.AsBuffer());
             return bitmap;
         }
 
-        static void MapFramePointToRotated(int x, int y, int width, int height, int rotation, out int targetX, out int targetY)
-        {
-            switch (rotation)
-            {
-                case 90:
-                    targetX = height - 1 - y;
-                    targetY = x;
-                    break;
-                case 180:
-                    targetX = width - 1 - x;
-                    targetY = height - 1 - y;
-                    break;
-                case 270:
-                    targetX = y;
-                    targetY = width - 1 - x;
-                    break;
-                default:
-                    targetX = x;
-                    targetY = y;
-                    break;
-            }
-        }
-
-        static Rect MapDetectedRectToFrame(Rect rotatedRect, int frameWidth, int frameHeight, int rotation)
+        static Rect MapDetectedRectToFrame(Rect detectedRect, int detectionWidth, int detectionHeight, int frameWidth, int frameHeight, int rotation)
         {
             int normalizedRotation = NormalizeRotation(rotation);
+            int fullRotatedWidth = normalizedRotation == 90 || normalizedRotation == 270 ? frameHeight : frameWidth;
+            int fullRotatedHeight = normalizedRotation == 90 || normalizedRotation == 270 ? frameWidth : frameHeight;
+            float scaleX = fullRotatedWidth / (float)Mathf.Max(1, detectionWidth);
+            float scaleY = fullRotatedHeight / (float)Mathf.Max(1, detectionHeight);
+            Rect rotatedRect = new Rect(
+                detectedRect.x * scaleX,
+                detectedRect.y * scaleY,
+                detectedRect.width * scaleX,
+                detectedRect.height * scaleY);
+
             Vector2[] corners =
             {
                 MapRotatedPointToFrame(rotatedRect.xMin, rotatedRect.yMin, frameWidth, frameHeight, normalizedRotation),
