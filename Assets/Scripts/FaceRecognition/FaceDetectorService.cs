@@ -30,6 +30,7 @@ namespace HoloFaceRecognition
         public string LastStatus { get; private set; } = "Detector not initialized";
         public string LastError { get; private set; } = string.Empty;
         public int LastDetectedFaceCount { get; private set; }
+        string _lastLoggedStatus = string.Empty;
 
 #if WINDOWS_UWP && !UNITY_EDITOR
         FaceDetector _detector;
@@ -43,7 +44,7 @@ namespace HoloFaceRecognition
                 _detector = await FaceDetector.CreateAsync();
                 LastStatus = "UWP FaceDetector initialized";
                 LastError = string.Empty;
-                UnityEngine.Debug.Log(LastStatus);
+                LogStatusChanged();
             }
             catch (Exception ex)
             {
@@ -55,7 +56,7 @@ namespace HoloFaceRecognition
 #else
             LastStatus = "Mock detector active";
             LastError = string.Empty;
-            UnityEngine.Debug.Log(LastStatus);
+            LogStatusChanged();
             await Task.CompletedTask;
 #endif
         }
@@ -79,13 +80,17 @@ namespace HoloFaceRecognition
 
                 int rotationUsed = 0;
                 IList<DetectedFace> detectedFaces = null;
-                foreach (int rotation in BuildRotationAttempts(frame.rotationAngle))
+                int[] rotationAttempts = BuildRotationAttempts(frame.rotationAngle);
+                var attemptSummary = new List<string>();
+                foreach (int rotation in rotationAttempts)
                 {
                     using (SoftwareBitmap bitmap = CreateGray8SoftwareBitmap(frame, rotation))
                     {
                         detectedFaces = await _detector.DetectFacesAsync(bitmap);
+                        int faceCount = detectedFaces == null ? 0 : detectedFaces.Count;
+                        attemptSummary.Add(rotation + ":" + faceCount);
                         rotationUsed = rotation;
-                        if (detectedFaces != null && detectedFaces.Count > 0)
+                        if (faceCount > 0)
                             break;
                     }
                 }
@@ -110,9 +115,11 @@ namespace HoloFaceRecognition
                 }
 
                 LastDetectedFaceCount = results.Count;
-                LastStatus = "faces detected: " + LastDetectedFaceCount + " rotation=" + rotationUsed;
+                LastStatus = LastDetectedFaceCount > 0
+                    ? "faces detected: " + LastDetectedFaceCount + " rotation=" + rotationUsed + " attempts=" + string.Join(",", attemptSummary.ToArray())
+                    : "faces detected: 0 attempts=" + string.Join(",", attemptSummary.ToArray());
                 LastError = string.Empty;
-                UnityEngine.Debug.Log(LastStatus);
+                LogStatusChanged();
             }
             catch (Exception ex)
             {
@@ -140,10 +147,19 @@ namespace HoloFaceRecognition
             LastDetectedFaceCount = results.Count;
             LastStatus = "Mock detector active; faces detected: " + LastDetectedFaceCount;
             LastError = string.Empty;
-            UnityEngine.Debug.Log(LastStatus);
+            LogStatusChanged();
 #endif
 
             return results;
+        }
+
+        void LogStatusChanged()
+        {
+            if (LastStatus == _lastLoggedStatus)
+                return;
+
+            _lastLoggedStatus = LastStatus;
+            UnityEngine.Debug.Log(LastStatus);
         }
 
 #if WINDOWS_UWP && !UNITY_EDITOR

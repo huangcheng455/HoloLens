@@ -34,17 +34,20 @@ namespace HoloFaceRecognition
         public Button clearDatabaseButton;
 
         [Header("Model")]
+        public bool enableOnnxRecognition = true;
         public string modelFileName = "ghostfacenet.onnx";
         public string modelName = "GhostFaceNet";
 
         [Header("Runtime")]
-        [Range(1, 30)] public int detectEveryNFrames = 5;
+        [Range(1, 30)] public int detectEveryNFrames = 1;
         [Range(0f, 1f)] public float threshold = 0.5f;
+        [Range(0f, 1f)] public float duplicateRegistrationThreshold = 0.8f;
+        public bool blockDuplicateFaceDifferentName = true;
         public float bboxPadding = 0.25f;
 
         [Header("Debug")]
         public bool enablePipelineDebugMode = true;
-        public bool logPipelineSteps = true;
+        public bool logPipelineSteps;
 
         [Header("HoloLens Test")]
         public bool enableAirTapRegister = true;
@@ -83,9 +86,12 @@ namespace HoloFaceRecognition
         string _lastError = string.Empty;
         string _lastInteractionStatus = string.Empty;
         bool _lastRegisterSucceeded;
+        int _lastProcessedCameraFrameCount;
         GameObject _popupRoot;
         Text _popupText;
         Coroutine _popupRoutine;
+
+        public bool LastRegisterSucceeded => _lastRegisterSucceeded;
 
 #if (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
         GestureRecognizer _tapRecognizer;
@@ -155,9 +161,19 @@ namespace HoloFaceRecognition
                 return;
             }
 
+            int currentCameraFrameCount = cameraReader.FrameCount;
+            if (currentCameraFrameCount <= _lastProcessedCameraFrameCount)
+            {
+                UpdateStatsText();
+                return;
+            }
+
             _frameCounter++;
             if (_frameCounter % Mathf.Max(1, detectEveryNFrames) == 0)
+            {
+                _lastProcessedCameraFrameCount = currentCameraFrameCount;
                 _ = ProcessFrameAsync(frame);
+            }
 
             UpdateStatsText();
         }
@@ -177,6 +193,18 @@ namespace HoloFaceRecognition
             var recognizerInitSw = Stopwatch.StartNew();
             try
             {
+                if (!enableOnnxRecognition)
+                {
+                    recognizerInitSw.Stop();
+                    _onnxInitMs = (float)recognizerInitSw.Elapsed.TotalMilliseconds;
+                    _recognizerInitialized = false;
+                    _onnxStatus = "ONNX: DISABLED";
+                    UnityEngine.Debug.LogWarning("ONNX recognition is disabled. Camera and face detection remain active.");
+                    _initialized = true;
+                    _initStatus = "Detection only";
+                    return;
+                }
+
 #if USE_ONNXRUNTIME
                 string modelPath = await PrepareModelFileAsync(modelFileName);
                 await _recognizer.InitializeAsync(modelPath, modelName);
@@ -201,7 +229,6 @@ namespace HoloFaceRecognition
                 _onnxStatus = "ONNX: FAILED - " + BuildOnnxInitError(ex);
                 _lastError = _onnxStatus;
                 UnityEngine.Debug.LogWarning(_lastError);
-                UnityEngine.Debug.LogException(ex);
             }
 
             _initialized = true;
@@ -456,6 +483,24 @@ namespace HoloFaceRecognition
             var registerSw = Stopwatch.StartNew();
             try
             {
+                if (blockDuplicateFaceDifferentName)
+                {
+                    FaceMatchResult duplicate = _matcher.FindBestMatch(_lastEmbedding, _database);
+                    bool hasDuplicate = !string.IsNullOrEmpty(duplicate.personId) && duplicate.similarity >= duplicateRegistrationThreshold;
+                    bool sameName = string.Equals(duplicate.name, personName, StringComparison.OrdinalIgnoreCase);
+                    if (hasDuplicate && !sameName)
+                    {
+                        registerSw.Stop();
+                        _lastRegisterDbMs = (float)registerSw.Elapsed.TotalMilliseconds;
+                        string message = string.Format("Face already registered as {0} ({1:0.000})", duplicate.name, duplicate.similarity);
+                        _lastInteractionStatus = message;
+                        UnityEngine.Debug.LogWarning(message + ". New name rejected: " + personName);
+                        SetStatusText(message);
+                        ShowPopup(message);
+                        return;
+                    }
+                }
+
                 _database.AddEmbedding(personName, _lastEmbedding, _recognizer.ModelName);
                 _database.Save();
                 registerSw.Stop();
@@ -479,6 +524,7 @@ namespace HoloFaceRecognition
 
         public void RegisterCurrentFaceFromUI()
         {
+            _lastRegisterSucceeded = false;
             string personName = registerNameInput == null ? string.Empty : registerNameInput.text.Trim();
             if (string.IsNullOrEmpty(personName))
             {
@@ -514,6 +560,7 @@ namespace HoloFaceRecognition
 
         public void RegisterCurrentFaceForHoloLensTest()
         {
+            _lastRegisterSucceeded = false;
             string personName = registerNameInput == null ? string.Empty : registerNameInput.text.Trim();
             if (string.IsNullOrEmpty(personName))
                 personName = string.IsNullOrWhiteSpace(hololensDefaultRegisterName) ? "HoloLensUser" : hololensDefaultRegisterName.Trim();
@@ -831,16 +878,23 @@ namespace HoloFaceRecognition
             if (statsText == null)
                 return;
 
-            statsText.fontSize = Mathf.Max(statsText.fontSize, 28);
+            statsText.fontSize = 22;
             statsText.color = Color.white;
             statsText.alignment = TextAnchor.UpperLeft;
-            statsText.horizontalOverflow = HorizontalWrapMode.Overflow;
+            statsText.horizontalOverflow = HorizontalWrapMode.Wrap;
             statsText.verticalOverflow = VerticalWrapMode.Overflow;
-            EnsureStatsBackgroundPanel();
 
             RectTransform rect = statsText.rectTransform;
             if (rect != null)
-                rect.sizeDelta = new Vector2(Mathf.Max(rect.sizeDelta.x, 1040f), Mathf.Max(rect.sizeDelta.y, 180f));
+            {
+                rect.anchorMin = new Vector2(0f, 0f);
+                rect.anchorMax = new Vector2(0f, 0f);
+                rect.pivot = new Vector2(0f, 0f);
+                rect.anchoredPosition = new Vector2(32f, 500f);
+                rect.sizeDelta = new Vector2(820f, 170f);
+            }
+
+            EnsureStatsBackgroundPanel();
         }
 
         void EnsureStatsBackgroundPanel()
@@ -876,7 +930,7 @@ namespace HoloFaceRecognition
             panelRect.anchorMax = textRect.anchorMax;
             panelRect.pivot = textRect.pivot;
             panelRect.anchoredPosition = textRect.anchoredPosition;
-            panelRect.sizeDelta = new Vector2(Mathf.Max(textRect.sizeDelta.x, 1040f), Mathf.Max(textRect.sizeDelta.y, 180f));
+            panelRect.sizeDelta = textRect.sizeDelta;
             panelImage.color = new Color(0f, 0f, 0f, 0.5f);
             panelImage.raycastTarget = false;
         }

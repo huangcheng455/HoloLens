@@ -13,6 +13,7 @@ namespace HoloFaceRecognition
         public Color unknownColor = new Color(1f, 0.68f, 0.08f, 1f);
         public Color debugColor = new Color(0.15f, 0.75f, 1f, 1f);
         public float borderThickness = 3f;
+        [Range(0f, 0.5f)] public float overlayBoxPadding = 0.18f;
         public bool drawDebugCenterTestBox;
         public bool applyCameraOrientationToOverlay;
         public bool pixelRectOriginBottomLeft = true;
@@ -58,7 +59,8 @@ namespace HoloFaceRecognition
                 RecognizedFace face = faces[i];
                 bool hasRecognitionScore = face.similarity > 0f;
                 Color color = face.name == "Unknown" || !hasRecognitionScore ? unknownColor : knownColor;
-                Rect rect = MapPixelRect(face.pixelRect, frameWidth, frameHeight, contentRect, rotationAngle, verticallyMirrored, pixelRectOriginBottomLeft);
+                Rect paddedPixelRect = AddPixelPadding(face.pixelRect, overlayBoxPadding, frameWidth, frameHeight);
+                Rect rect = MapPixelRect(paddedPixelRect, frameWidth, frameHeight, contentRect, rotationAngle, verticallyMirrored, pixelRectOriginBottomLeft);
                 string label = hasRecognitionScore ? string.Format("{0} {1:0.00}", face.name, face.similarity) : face.name;
                 _pool[i].Set(rect, color, label, borderThickness);
             }
@@ -188,6 +190,20 @@ namespace HoloFaceRecognition
                 yMax = displayRect.yMax - Mathf.Clamp01(min.y) * displayRect.height;
                 yMin = displayRect.yMax - Mathf.Clamp01(max.y) * displayRect.height;
             }
+            return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+        }
+
+        static Rect AddPixelPadding(Rect rect, float padding, int frameWidth, int frameHeight)
+        {
+            if (padding <= 0f)
+                return rect;
+
+            float padX = rect.width * padding;
+            float padY = rect.height * padding;
+            float xMin = Mathf.Clamp(rect.xMin - padX, 0f, frameWidth);
+            float xMax = Mathf.Clamp(rect.xMax + padX, 0f, frameWidth);
+            float yMin = Mathf.Clamp(rect.yMin - padY, 0f, frameHeight);
+            float yMax = Mathf.Clamp(rect.yMax + padY, 0f, frameHeight);
             return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
         }
 

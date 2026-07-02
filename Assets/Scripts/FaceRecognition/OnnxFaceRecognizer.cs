@@ -5,7 +5,11 @@ using System.Linq;
 using System.Threading.Tasks;
 using UnityEngine;
 
-#if USE_ONNXRUNTIME
+#if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+using Windows.AI.MachineLearning;
+#endif
+
+#if USE_ONNXRUNTIME && !(ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR)
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 #endif
@@ -21,13 +25,19 @@ namespace HoloFaceRecognition
         public int EmbeddingSize { get; private set; } = 512;
         public float LastInferenceMs { get; private set; }
 
-#if USE_ONNXRUNTIME
         enum InputTensorLayout
         {
             Nchw,
             Nhwc
         }
 
+#if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+        LearningModel _winmlModel;
+        LearningModelSession _winmlSession;
+        string _inputName;
+        string _outputName;
+        InputTensorLayout _inputLayout;
+#elif USE_ONNXRUNTIME
         InferenceSession _session;
         string _inputName;
         string _outputName;
@@ -38,7 +48,6 @@ namespace HoloFaceRecognition
         {
             ModelName = string.IsNullOrEmpty(modelName) ? Path.GetFileNameWithoutExtension(modelPath) : modelName;
 
-#if USE_ONNXRUNTIME
             string resolvedModelPath = string.IsNullOrEmpty(modelPath)
                 ? Path.Combine(Application.streamingAssetsPath, DefaultModelFileName)
                 : modelPath;
@@ -49,6 +58,50 @@ namespace HoloFaceRecognition
                 throw new FileNotFoundException(message, resolvedModelPath);
             }
 
+#if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+            _winmlModel = LearningModel.LoadFromFilePath(resolvedModelPath);
+            _winmlSession = new LearningModelSession(_winmlModel);
+
+            var input = _winmlModel.InputFeatures.FirstOrDefault() as TensorFeatureDescriptor;
+            if (input == null || string.IsNullOrEmpty(input.Name))
+            {
+                UnityEngine.Debug.LogError("WinML model has no tensor input metadata.");
+                throw new InvalidOperationException("WinML model has no tensor input metadata.");
+            }
+
+            var output = _winmlModel.OutputFeatures.FirstOrDefault() as TensorFeatureDescriptor;
+            if (output == null || string.IsNullOrEmpty(output.Name))
+            {
+                UnityEngine.Debug.LogError("WinML model has no tensor output metadata.");
+                throw new InvalidOperationException("WinML model has no tensor output metadata.");
+            }
+
+            _inputName = input.Name;
+            _outputName = output.Name;
+
+            long[] inputShape = ToShapeArray(input.Shape);
+            long[] outputShape = ToShapeArray(output.Shape);
+
+            if (!TryGetInputTensorLayout(inputShape, out _inputLayout))
+            {
+                string message = "WinML input shape is not supported. Expected [1, 3, 112, 112] NCHW or [1, 112, 112, 3] NHWC, actual: " + FormatShape(inputShape);
+                UnityEngine.Debug.LogError(message);
+                throw new InvalidOperationException(message);
+            }
+
+            if (outputShape != null && outputShape.Length > 0)
+                EmbeddingSize = Math.Abs((int)outputShape[outputShape.Length - 1]);
+
+            UnityEngine.Debug.Log(
+                "WinML model loaded.\n" +
+                "modelPath: " + resolvedModelPath + "\n" +
+                "input name: " + _inputName + "\n" +
+                "input shape: " + FormatShape(inputShape) + "\n" +
+                "input layout: " + _inputLayout + "\n" +
+                "output name: " + _outputName + "\n" +
+                "output shape: " + FormatShape(outputShape) + "\n" +
+                "embedding dimension: " + EmbeddingSize);
+#elif USE_ONNXRUNTIME
             try
             {
                 _session = new InferenceSession(resolvedModelPath);
@@ -70,8 +123,8 @@ namespace HoloFaceRecognition
                 _inputName = input.Key;
                 _outputName = output.Key;
 
-                int[] inputShape = ToShapeArray(input.Value.Dimensions);
-                int[] outputShape = ToShapeArray(output.Value.Dimensions);
+                long[] inputShape = ToShapeArray(input.Value.Dimensions);
+                long[] outputShape = ToShapeArray(output.Value.Dimensions);
 
                 if (!TryGetInputTensorLayout(inputShape, out _inputLayout))
                 {
@@ -81,7 +134,7 @@ namespace HoloFaceRecognition
                 }
 
                 if (outputShape != null && outputShape.Length > 0)
-                    EmbeddingSize = Math.Abs(outputShape[outputShape.Length - 1]);
+                    EmbeddingSize = Math.Abs((int)outputShape[outputShape.Length - 1]);
 
                 UnityEngine.Debug.Log(
                     "ONNX Runtime model loaded.\n" +
@@ -121,7 +174,11 @@ namespace HoloFaceRecognition
 
         public Task<float[]> ExtractEmbeddingAsync(Color32[] faceCrop, int cropWidth, int cropHeight)
         {
+#if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+            return ExtractEmbeddingWithWinMLAsync(faceCrop, cropWidth, cropHeight);
+#else
             return Task.Run(() => ExtractEmbedding(faceCrop, cropWidth, cropHeight));
+#endif
         }
 
         public Task<float[]> ExtractEmbeddingAsync(Texture2D faceTexture)
@@ -139,7 +196,7 @@ namespace HoloFaceRecognition
         {
             var sw = Stopwatch.StartNew();
 
-#if USE_ONNXRUNTIME
+#if USE_ONNXRUNTIME && !(ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR)
             if (_session == null)
             {
                 UnityEngine.Debug.LogError("Cannot extract embedding: ONNX Runtime session has not been initialized.");
@@ -173,8 +230,49 @@ namespace HoloFaceRecognition
 #endif
         }
 
-#if USE_ONNXRUNTIME
+#if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+        async Task<float[]> ExtractEmbeddingWithWinMLAsync(Color32[] faceCrop, int cropWidth, int cropHeight)
+        {
+            var sw = Stopwatch.StartNew();
+
+            if (_winmlSession == null)
+            {
+                UnityEngine.Debug.LogError("Cannot extract embedding: WinML session has not been initialized.");
+                throw new InvalidOperationException("Recognizer has not been initialized.");
+            }
+
+            long[] tensorShape = _inputLayout == InputTensorLayout.Nchw
+                ? new long[] { 1, InputChannels, FaceAligner.OutputSize, FaceAligner.OutputSize }
+                : new long[] { 1, FaceAligner.OutputSize, FaceAligner.OutputSize, InputChannels };
+
+            float[] inputData = PreprocessToArray(faceCrop, cropWidth, cropHeight, _inputLayout);
+            TensorFloat inputTensor = TensorFloat.CreateFromArray(tensorShape, inputData);
+            var binding = new LearningModelBinding(_winmlSession);
+            binding.Bind(_inputName, inputTensor);
+
+            LearningModelEvaluationResult result = await _winmlSession.EvaluateAsync(binding, "face-embedding");
+            TensorFloat outputTensor = result.Outputs[_outputName] as TensorFloat;
+            if (outputTensor == null)
+                throw new InvalidOperationException("WinML model output is not a TensorFloat.");
+
+            float[] embedding = outputTensor.GetAsVectorView().ToArray();
+            LastInferenceMs = (float)sw.Elapsed.TotalMilliseconds;
+            return L2Normalize(embedding);
+        }
+#endif
+
+#if USE_ONNXRUNTIME && !(ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR)
         static DenseTensor<float> Preprocess(Color32[] pixels, int sourceWidth, int sourceHeight, InputTensorLayout inputLayout)
+        {
+            int[] tensorShape = inputLayout == InputTensorLayout.Nchw
+                ? new[] { 1, InputChannels, FaceAligner.OutputSize, FaceAligner.OutputSize }
+                : new[] { 1, FaceAligner.OutputSize, FaceAligner.OutputSize, InputChannels };
+
+            return new DenseTensor<float>(PreprocessToArray(pixels, sourceWidth, sourceHeight, inputLayout), tensorShape);
+        }
+#endif
+
+        static float[] PreprocessToArray(Color32[] pixels, int sourceWidth, int sourceHeight, InputTensorLayout inputLayout)
         {
             if (pixels == null || pixels.Length == 0)
             {
@@ -189,11 +287,7 @@ namespace HoloFaceRecognition
                 throw new ArgumentException(message, "pixels");
             }
 
-            int[] tensorShape = inputLayout == InputTensorLayout.Nchw
-                ? new[] { 1, InputChannels, FaceAligner.OutputSize, FaceAligner.OutputSize }
-                : new[] { 1, FaceAligner.OutputSize, FaceAligner.OutputSize, InputChannels };
-
-            var tensor = new DenseTensor<float>(tensorShape);
+            float[] tensor = new float[FaceAligner.OutputSize * FaceAligner.OutputSize * InputChannels];
             for (int y = 0; y < FaceAligner.OutputSize; y++)
             {
                 float sourceY = (y + 0.5f) * sourceHeight / FaceAligner.OutputSize - 0.5f;
@@ -203,22 +297,25 @@ namespace HoloFaceRecognition
                     Color32 c = SampleBilinear(pixels, sourceWidth, sourceHeight, sourceX, sourceY);
                     if (inputLayout == InputTensorLayout.Nchw)
                     {
-                        tensor[0, 0, y, x] = (c.r - 127.5f) / 128f;
-                        tensor[0, 1, y, x] = (c.g - 127.5f) / 128f;
-                        tensor[0, 2, y, x] = (c.b - 127.5f) / 128f;
+                        int planeSize = FaceAligner.OutputSize * FaceAligner.OutputSize;
+                        int pixelIndex = y * FaceAligner.OutputSize + x;
+                        tensor[pixelIndex] = (c.r - 127.5f) / 128f;
+                        tensor[planeSize + pixelIndex] = (c.g - 127.5f) / 128f;
+                        tensor[planeSize * 2 + pixelIndex] = (c.b - 127.5f) / 128f;
                     }
                     else
                     {
-                        tensor[0, y, x, 0] = (c.r - 127.5f) / 128f;
-                        tensor[0, y, x, 1] = (c.g - 127.5f) / 128f;
-                        tensor[0, y, x, 2] = (c.b - 127.5f) / 128f;
+                        int index = (y * FaceAligner.OutputSize + x) * InputChannels;
+                        tensor[index] = (c.r - 127.5f) / 128f;
+                        tensor[index + 1] = (c.g - 127.5f) / 128f;
+                        tensor[index + 2] = (c.b - 127.5f) / 128f;
                     }
                 }
             }
             return tensor;
         }
 
-        static bool TryGetInputTensorLayout(int[] shape, out InputTensorLayout inputLayout)
+        static bool TryGetInputTensorLayout(long[] shape, out InputTensorLayout inputLayout)
         {
             inputLayout = InputTensorLayout.Nchw;
             if (shape == null || shape.Length != 4 || (shape[0] != 1 && shape[0] >= 0))
@@ -239,12 +336,17 @@ namespace HoloFaceRecognition
             return false;
         }
 
-        static int[] ToShapeArray(System.Collections.Generic.IEnumerable<int> shape)
+        static long[] ToShapeArray(System.Collections.Generic.IEnumerable<int> shape)
+        {
+            return shape == null ? null : shape.Select(d => (long)d).ToArray();
+        }
+
+        static long[] ToShapeArray(System.Collections.Generic.IEnumerable<long> shape)
         {
             return shape == null ? null : shape.ToArray();
         }
 
-        static string FormatShape(int[] shape)
+        static string FormatShape(long[] shape)
         {
             return shape == null ? "[]" : "[" + string.Join(", ", shape.Select(d => d < 0 ? "dynamic" : d.ToString()).ToArray()) + "]";
         }
@@ -269,7 +371,6 @@ namespace HoloFaceRecognition
             Color c1 = Color.Lerp(c01, c11, tx);
             return Color.Lerp(c0, c1, ty);
         }
-#endif
 
         public static float[] L2Normalize(float[] vector)
         {
@@ -285,7 +386,12 @@ namespace HoloFaceRecognition
 
         public void Dispose()
         {
-#if USE_ONNXRUNTIME
+#if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
+            _winmlSession?.Dispose();
+            _winmlSession = null;
+            _winmlModel?.Dispose();
+            _winmlModel = null;
+#elif USE_ONNXRUNTIME
             _session?.Dispose();
             _session = null;
 #endif

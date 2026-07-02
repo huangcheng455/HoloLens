@@ -20,13 +20,14 @@ namespace HoloFaceRecognition
     public sealed class HoloLensCameraReader : MonoBehaviour
     {
         [Header("Camera")]
-        public int requestedWidth = 896;
-        public int requestedHeight = 504;
+        public int requestedWidth = 640;
+        public int requestedHeight = 360;
         public int requestedFps = 30;
-        [Range(1, 30)] public int captureEveryNFrames = 5;
+        [Range(1, 30)] public int captureEveryNFrames = 3;
         public bool requestPermissionOnStart;
         public bool autoRetryCamera = true;
         public float retryIntervalSeconds = 3f;
+        public float firstFrameTimeoutSeconds = 6f;
         public bool useFrontFacingCamera;
 
         [Header("Preview")]
@@ -41,6 +42,7 @@ namespace HoloFaceRecognition
         bool _permissionGranted;
         float _nextRetryTime;
         bool _startingCamera;
+        float _cameraStartTime;
         int _webCamUpdateCount;
         int _frameCount;
         string _selectedDeviceName = string.Empty;
@@ -106,7 +108,10 @@ namespace HoloFaceRecognition
             }
 
             if (!_webCamTexture.didUpdateThisFrame)
+            {
+                RestartCameraIfFirstFrameTimedOut();
                 return;
+            }
 
             _webCamUpdateCount++;
             if (_webCamUpdateCount % Mathf.Max(1, captureEveryNFrames) != 0)
@@ -117,6 +122,7 @@ namespace HoloFaceRecognition
             if (width <= 16 || height <= 16)
             {
                 _lastStatus = "Camera is starting: " + width + "x" + height;
+                RestartCameraIfFirstFrameTimedOut();
                 return;
             }
 
@@ -257,6 +263,8 @@ namespace HoloFaceRecognition
                     previewImage.texture = _webCamTexture;
 
                 _isRunning = true;
+                _cameraStartTime = Time.realtimeSinceStartup;
+                _webCamUpdateCount = 0;
                 _lastError = string.Empty;
                 _lastStatus = "Camera started: " + _selectedDeviceName + ", requested=" + width + "x" + height + "@" + fps + ", devices=" + deviceCount;
                 Debug.Log(_lastStatus);
@@ -292,6 +300,22 @@ namespace HoloFaceRecognition
             Destroy(_webCamTexture);
             _webCamTexture = null;
             _lastStatus = "Camera stopped";
+        }
+
+        void RestartCameraIfFirstFrameTimedOut()
+        {
+            if (!autoRetryCamera || firstFrameTimeoutSeconds <= 0f || HasReceivedFrame)
+                return;
+
+            if (Time.realtimeSinceStartup - _cameraStartTime < firstFrameTimeoutSeconds)
+                return;
+
+            _lastStatus = "Camera start timed out before first frame; retrying";
+            _lastError = "Camera produced no frame after " + firstFrameTimeoutSeconds.ToString("0.0") + " seconds. Check camera privacy, close other camera apps, or reboot HoloLens.";
+            Debug.LogWarning(_lastError);
+
+            StopCamera();
+            _nextRetryTime = Time.realtimeSinceStartup + Mathf.Max(1f, retryIntervalSeconds);
         }
 
         public bool TryGetLatestFrame(out CameraFrame frame)

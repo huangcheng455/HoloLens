@@ -16,6 +16,16 @@ namespace HoloFaceRecognition
 
         public FaceMatchResult Match(float[] embedding, FaceDatabase database)
         {
+            var result = FindBestMatch(embedding, database);
+
+            result.isKnown = result.similarity >= Threshold;
+            if (!result.isKnown)
+                result.name = "Unknown";
+            return result;
+        }
+
+        public FaceMatchResult FindBestMatch(float[] embedding, FaceDatabase database)
+        {
             var result = new FaceMatchResult();
             if (embedding == null || database?.Data?.people == null)
                 return result;
@@ -40,9 +50,6 @@ namespace HoloFaceRecognition
                 }
             }
 
-            result.isKnown = result.similarity >= Threshold;
-            if (!result.isKnown)
-                result.name = "Unknown";
             return result;
         }
 
