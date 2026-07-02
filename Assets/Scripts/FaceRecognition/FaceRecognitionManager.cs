@@ -35,6 +35,7 @@ namespace HoloFaceRecognition
 
         [Header("Model")]
         public bool enableOnnxRecognition = true;
+        public bool preferWinMLGpu = true;
         public string modelFileName = "ghostfacenet.onnx";
         public string modelName = "GhostFaceNet";
 
@@ -207,12 +208,12 @@ namespace HoloFaceRecognition
 
 #if USE_ONNXRUNTIME
                 string modelPath = await PrepareModelFileAsync(modelFileName);
-                await _recognizer.InitializeAsync(modelPath, modelName);
+                await _recognizer.InitializeAsync(modelPath, modelName, preferWinMLGpu);
                 recognizerInitSw.Stop();
                 _onnxInitMs = (float)recognizerInitSw.Elapsed.TotalMilliseconds;
                 _recognizerInitialized = true;
-                _onnxStatus = "Recognizer: READY";
-                UnityEngine.Debug.Log("Recognizer: READY. ONNX init time: " + _onnxInitMs.ToString("0.0") + " ms");
+                _onnxStatus = "Recognizer: READY (" + _recognizer.RuntimeDevice + ")";
+                UnityEngine.Debug.Log("Recognizer: READY. ONNX init time: " + _onnxInitMs.ToString("0.0") + " ms, device=" + _recognizer.RuntimeDevice);
 #else
                 recognizerInitSw.Stop();
                 _onnxInitMs = (float)recognizerInitSw.Elapsed.TotalMilliseconds;
