@@ -937,7 +937,6 @@ MonoBehaviour:
   statusText: {fileID: 2100000034}
   clearDatabaseButton: {fileID: 0}
   enableOnnxRecognition: 1
-  preferWinMLGpu: 1
   modelFileName: ghostfacenet.onnx
   modelName: GhostFaceNet
   detectEveryNFrames: 1

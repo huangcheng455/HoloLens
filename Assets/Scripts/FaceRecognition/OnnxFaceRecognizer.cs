@@ -24,7 +24,6 @@ namespace HoloFaceRecognition
         public string ModelName { get; private set; } = "mock-recognizer";
         public int EmbeddingSize { get; private set; } = 512;
         public float LastInferenceMs { get; private set; }
-        public string RuntimeDevice { get; private set; } = "Not initialized";
 
         enum InputTensorLayout
         {
@@ -47,11 +46,6 @@ namespace HoloFaceRecognition
 
         public Task InitializeAsync(string modelPath, string modelName)
         {
-            return InitializeAsync(modelPath, modelName, true);
-        }
-
-        public Task InitializeAsync(string modelPath, string modelName, bool preferWinMLGpu)
-        {
             ModelName = string.IsNullOrEmpty(modelName) ? Path.GetFileNameWithoutExtension(modelPath) : modelName;
 
             string resolvedModelPath = string.IsNullOrEmpty(modelPath)
@@ -66,7 +60,7 @@ namespace HoloFaceRecognition
 
 #if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
             _winmlModel = LearningModel.LoadFromFilePath(resolvedModelPath);
-            _winmlSession = CreateWinMLSession(_winmlModel, preferWinMLGpu);
+            _winmlSession = new LearningModelSession(_winmlModel);
 
             var input = _winmlModel.InputFeatures.FirstOrDefault() as TensorFeatureDescriptor;
             if (input == null || string.IsNullOrEmpty(input.Name))
@@ -106,7 +100,6 @@ namespace HoloFaceRecognition
                 "input layout: " + _inputLayout + "\n" +
                 "output name: " + _outputName + "\n" +
                 "output shape: " + FormatShape(outputShape) + "\n" +
-                "runtime device: " + RuntimeDevice + "\n" +
                 "embedding dimension: " + EmbeddingSize);
 #elif USE_ONNXRUNTIME
             try
@@ -173,42 +166,6 @@ namespace HoloFaceRecognition
 #endif
             return Task.CompletedTask;
         }
-
-#if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
-        LearningModelSession CreateWinMLSession(LearningModel model, bool preferGpu)
-        {
-            if (preferGpu)
-            {
-                try
-                {
-                    var device = new LearningModelDevice(LearningModelDeviceKind.DirectXHighPerformance);
-                    RuntimeDevice = "WinML DirectXHighPerformance";
-                    UnityEngine.Debug.Log("Trying WinML device: " + RuntimeDevice);
-                    return new LearningModelSession(model, device);
-                }
-                catch (Exception ex)
-                {
-                    UnityEngine.Debug.LogWarning("WinML DirectXHighPerformance unavailable; trying DirectX. " + ex.GetType().Name + ": " + ex.Message);
-                }
-
-                try
-                {
-                    var device = new LearningModelDevice(LearningModelDeviceKind.DirectX);
-                    RuntimeDevice = "WinML DirectX";
-                    UnityEngine.Debug.Log("Trying WinML device: " + RuntimeDevice);
-                    return new LearningModelSession(model, device);
-                }
-                catch (Exception ex)
-                {
-                    UnityEngine.Debug.LogWarning("WinML DirectX unavailable; falling back to default device. " + ex.GetType().Name + ": " + ex.Message);
-                }
-            }
-
-            RuntimeDevice = preferGpu ? "WinML Default fallback" : "WinML Default";
-            UnityEngine.Debug.Log("Using WinML device: " + RuntimeDevice);
-            return new LearningModelSession(model);
-        }
-#endif
 
         public Task<float[]> ExtractEmbeddingAsync(Color32[] alignedFace112)
         {
