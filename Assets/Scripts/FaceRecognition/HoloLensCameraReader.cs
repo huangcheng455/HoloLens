@@ -134,17 +134,15 @@ namespace HoloFaceRecognition
             int rotationAngle = _webCamTexture.videoRotationAngle;
             bool verticallyMirrored = _webCamTexture.videoVerticallyMirrored;
 
-            var copy = new Color32[pixelCount];
-            Array.Copy(_pixelBuffer, copy, pixelCount);
-            _latestFrame = new CameraFrame
-            {
-                width = width,
-                height = height,
-                pixels = copy,
-                timestamp = Time.realtimeSinceStartup,
-                rotationAngle = rotationAngle,
-                verticallyMirrored = verticallyMirrored
-            };
+            if (_latestFrame == null)
+                _latestFrame = new CameraFrame();
+
+            _latestFrame.width = width;
+            _latestFrame.height = height;
+            _latestFrame.pixels = _pixelBuffer;
+            _latestFrame.timestamp = Time.realtimeSinceStartup;
+            _latestFrame.rotationAngle = rotationAngle;
+            _latestFrame.verticallyMirrored = verticallyMirrored;
 
             _frameCount++;
             _lastStatus = "Frame received: " + width + "x" + height + ", count=" + _frameCount;

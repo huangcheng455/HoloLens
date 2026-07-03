@@ -24,6 +24,7 @@ namespace HoloFaceRecognition
         public string ModelName { get; private set; } = "mock-recognizer";
         public int EmbeddingSize { get; private set; } = 512;
         public float LastInferenceMs { get; private set; }
+        float[] _inputTensorBuffer;
 
         enum InputTensorLayout
         {
@@ -34,14 +35,17 @@ namespace HoloFaceRecognition
 #if ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR
         LearningModel _winmlModel;
         LearningModelSession _winmlSession;
+        LearningModelBinding _winmlBinding;
         string _inputName;
         string _outputName;
         InputTensorLayout _inputLayout;
+        long[] _winmlTensorShape;
 #elif USE_ONNXRUNTIME
         InferenceSession _session;
         string _inputName;
         string _outputName;
         InputTensorLayout _inputLayout;
+        int[] _onnxTensorShape;
 #endif
 
         public Task InitializeAsync(string modelPath, string modelName)
@@ -92,6 +96,12 @@ namespace HoloFaceRecognition
             if (outputShape != null && outputShape.Length > 0)
                 EmbeddingSize = Math.Abs((int)outputShape[outputShape.Length - 1]);
 
+            _winmlTensorShape = _inputLayout == InputTensorLayout.Nchw
+                ? new long[] { 1, InputChannels, FaceAligner.OutputSize, FaceAligner.OutputSize }
+                : new long[] { 1, FaceAligner.OutputSize, FaceAligner.OutputSize, InputChannels };
+            _inputTensorBuffer = new float[FaceAligner.OutputSize * FaceAligner.OutputSize * InputChannels];
+            _winmlBinding = new LearningModelBinding(_winmlSession);
+
             UnityEngine.Debug.Log(
                 "WinML model loaded.\n" +
                 "modelPath: " + resolvedModelPath + "\n" +
@@ -135,6 +145,11 @@ namespace HoloFaceRecognition
 
                 if (outputShape != null && outputShape.Length > 0)
                     EmbeddingSize = Math.Abs((int)outputShape[outputShape.Length - 1]);
+
+                _onnxTensorShape = _inputLayout == InputTensorLayout.Nchw
+                    ? new[] { 1, InputChannels, FaceAligner.OutputSize, FaceAligner.OutputSize }
+                    : new[] { 1, FaceAligner.OutputSize, FaceAligner.OutputSize, InputChannels };
+                _inputTensorBuffer = new float[FaceAligner.OutputSize * FaceAligner.OutputSize * InputChannels];
 
                 UnityEngine.Debug.Log(
                     "ONNX Runtime model loaded.\n" +
@@ -241,16 +256,11 @@ namespace HoloFaceRecognition
                 throw new InvalidOperationException("Recognizer has not been initialized.");
             }
 
-            long[] tensorShape = _inputLayout == InputTensorLayout.Nchw
-                ? new long[] { 1, InputChannels, FaceAligner.OutputSize, FaceAligner.OutputSize }
-                : new long[] { 1, FaceAligner.OutputSize, FaceAligner.OutputSize, InputChannels };
-
             float[] inputData = PreprocessToArray(faceCrop, cropWidth, cropHeight, _inputLayout);
-            TensorFloat inputTensor = TensorFloat.CreateFromArray(tensorShape, inputData);
-            var binding = new LearningModelBinding(_winmlSession);
-            binding.Bind(_inputName, inputTensor);
+            TensorFloat inputTensor = TensorFloat.CreateFromArray(_winmlTensorShape, inputData);
+            _winmlBinding.Bind(_inputName, inputTensor);
 
-            LearningModelEvaluationResult result = await _winmlSession.EvaluateAsync(binding, "face-embedding");
+            LearningModelEvaluationResult result = await _winmlSession.EvaluateAsync(_winmlBinding, "face-embedding");
             TensorFloat outputTensor = result.Outputs[_outputName] as TensorFloat;
             if (outputTensor == null)
                 throw new InvalidOperationException("WinML model output is not a TensorFloat.");
@@ -262,17 +272,13 @@ namespace HoloFaceRecognition
 #endif
 
 #if USE_ONNXRUNTIME && !(ENABLE_WINMD_SUPPORT && (UNITY_WSA || WINDOWS_UWP) && !UNITY_EDITOR)
-        static DenseTensor<float> Preprocess(Color32[] pixels, int sourceWidth, int sourceHeight, InputTensorLayout inputLayout)
+        DenseTensor<float> Preprocess(Color32[] pixels, int sourceWidth, int sourceHeight, InputTensorLayout inputLayout)
         {
-            int[] tensorShape = inputLayout == InputTensorLayout.Nchw
-                ? new[] { 1, InputChannels, FaceAligner.OutputSize, FaceAligner.OutputSize }
-                : new[] { 1, FaceAligner.OutputSize, FaceAligner.OutputSize, InputChannels };
-
-            return new DenseTensor<float>(PreprocessToArray(pixels, sourceWidth, sourceHeight, inputLayout), tensorShape);
+            return new DenseTensor<float>(PreprocessToArray(pixels, sourceWidth, sourceHeight, inputLayout), _onnxTensorShape);
         }
 #endif
 
-        static float[] PreprocessToArray(Color32[] pixels, int sourceWidth, int sourceHeight, InputTensorLayout inputLayout)
+        float[] PreprocessToArray(Color32[] pixels, int sourceWidth, int sourceHeight, InputTensorLayout inputLayout)
         {
             if (pixels == null || pixels.Length == 0)
             {
@@ -287,7 +293,10 @@ namespace HoloFaceRecognition
                 throw new ArgumentException(message, "pixels");
             }
 
-            float[] tensor = new float[FaceAligner.OutputSize * FaceAligner.OutputSize * InputChannels];
+            if (_inputTensorBuffer == null || _inputTensorBuffer.Length != FaceAligner.OutputSize * FaceAligner.OutputSize * InputChannels)
+                _inputTensorBuffer = new float[FaceAligner.OutputSize * FaceAligner.OutputSize * InputChannels];
+
+            float[] tensor = _inputTensorBuffer;
             for (int y = 0; y < FaceAligner.OutputSize; y++)
             {
                 float sourceY = (y + 0.5f) * sourceHeight / FaceAligner.OutputSize - 0.5f;

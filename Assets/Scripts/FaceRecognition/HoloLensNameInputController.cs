@@ -147,6 +147,16 @@ namespace HoloFaceRecognition
             faceRecognitionManager.RegisterCurrentFaceFromUI();
         }
 
+        public bool UsesInputField(InputField inputField)
+        {
+            return targetInputField != null && targetInputField == inputField;
+        }
+
+        public void ClearNameAfterSuccessfulRegister()
+        {
+            ApplyName(string.Empty);
+        }
+
         private void ApplyName(string value)
         {
             if (targetInputField != null)

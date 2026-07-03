@@ -34,6 +34,7 @@ namespace HoloFaceRecognition
 
 #if WINDOWS_UWP && !UNITY_EDITOR
         FaceDetector _detector;
+        byte[] _grayBuffer;
 #endif
 
         public async Task InitializeAsync()
@@ -176,7 +177,7 @@ namespace HoloFaceRecognition
             return rotations.ToArray();
         }
 
-        static SoftwareBitmap CreateGray8SoftwareBitmap(CameraFrame frame, int rotation)
+        SoftwareBitmap CreateGray8SoftwareBitmap(CameraFrame frame, int rotation)
         {
             int normalizedRotation = NormalizeRotation(rotation);
             int bitmapWidth = normalizedRotation == 90 || normalizedRotation == 270 ? frame.height : frame.width;
@@ -188,7 +189,10 @@ namespace HoloFaceRecognition
                 BitmapAlphaMode.Ignore
             );
 
-            byte[] bytes = new byte[bitmapWidth * bitmapHeight];
+            int byteCount = bitmapWidth * bitmapHeight;
+            if (_grayBuffer == null || _grayBuffer.Length != byteCount)
+                _grayBuffer = new byte[byteCount];
+
             int length = Math.Min(frame.pixels.Length, frame.width * frame.height);
 
             for (int i = 0; i < length; i++)
@@ -200,10 +204,10 @@ namespace HoloFaceRecognition
                 MapFramePointToRotated(sourceX, sourceY, frame.width, frame.height, normalizedRotation, out targetX, out targetY);
 
                 Color32 c = frame.pixels[i];
-                bytes[targetY * bitmapWidth + targetX] = (byte)((c.r * 299 + c.g * 587 + c.b * 114) / 1000);
+                _grayBuffer[targetY * bitmapWidth + targetX] = (byte)((c.r * 299 + c.g * 587 + c.b * 114) / 1000);
             }
 
-            bitmap.CopyFromBuffer(bytes.AsBuffer());
+            bitmap.CopyFromBuffer(_grayBuffer.AsBuffer());
             return bitmap;
         }
 

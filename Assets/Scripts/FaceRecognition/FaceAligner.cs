@@ -6,6 +6,7 @@ namespace HoloFaceRecognition
     public sealed class FaceAligner
     {
         public const int OutputSize = 112;
+        readonly Color32[] _outputBuffer = new Color32[OutputSize * OutputSize];
 
         static readonly Vector2[] ArcFace112Template =
         {
@@ -31,34 +32,32 @@ namespace HoloFaceRecognition
             float cy = bbox.y + bbox.height * 0.5f;
             var square = new Rect(cx - side * 0.5f, cy - side * 0.5f, side, side);
 
-            var output = new Color32[OutputSize * OutputSize];
             for (int y = 0; y < OutputSize; y++)
             {
                 float sy = square.y + (y + 0.5f) * square.height / OutputSize;
                 for (int x = 0; x < OutputSize; x++)
                 {
                     float sx = square.x + (x + 0.5f) * square.width / OutputSize;
-                    output[y * OutputSize + x] = SampleBilinear(source, width, height, sx, sy);
+                    _outputBuffer[y * OutputSize + x] = SampleBilinear(source, width, height, sx, sy);
                 }
             }
-            return output;
+            return _outputBuffer;
         }
 
         public Color32[] AlignByLandmarks(Color32[] source, int width, int height, Vector2[] landmarks)
         {
             SimilarityTransform transform = EstimateSimilarity(ArcFace112Template, landmarks);
-            var output = new Color32[OutputSize * OutputSize];
 
             for (int y = 0; y < OutputSize; y++)
             {
                 for (int x = 0; x < OutputSize; x++)
                 {
                     Vector2 src = transform.TransformPoint(new Vector2(x, y));
-                    output[y * OutputSize + x] = SampleBilinear(source, width, height, src.x, src.y);
+                    _outputBuffer[y * OutputSize + x] = SampleBilinear(source, width, height, src.x, src.y);
                 }
             }
 
-            return output;
+            return _outputBuffer;
         }
 
         static SimilarityTransform EstimateSimilarity(Vector2[] dst, Vector2[] src)
